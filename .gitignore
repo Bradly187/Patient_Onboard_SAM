@@ -1,0 +1,18 @@
+# SAM build artifacts
+.aws-sam/
+samconfig.toml.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Sample data — zip bundles contain real-looking PII (license/selfie images)
+environment/*.zip
+
+# AWS credentials — never commit these
+.aws/
+credentials

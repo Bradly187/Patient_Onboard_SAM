@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  clinic-patient-onboarding
+
+  SAM template for clinic patient onboarding — identity verification via
+  Rekognition face match, Textract driver's license OCR, and Textract
+  insurance card extraction. Results are written to DynamoDB and posted
+  to the ClinicScheduler Web API.
+
+#-----Start - Parameters -----#
+Parameters:
+  ClinicApiUrl:
+    Type: String
+    Description: >
+      Base URL of the ClinicScheduler Web API (no trailing slash).
+      e.g. https://clinic.example.com/api
+  StaffAlertEmail:
+    Type: String
+    Description: >
+      Email address that receives SNS alerts for failed verifications
+      and cards requiring manual review.
+#-----End - Parameters -----#
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Runtime: python3.13
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: clinic-onboarding
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:51
+
+Resources:
+
+  #-----Start - S3 document bucket -----#
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub clinic-onboarding-documents-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # Raw images are no longer needed after 90 days — processed data lives in DynamoDB
+          - Id: ExpireRawImages
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  DocumentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: s3:*
+            Effect: Deny
+            Resource:
+              - !Sub arn:aws:s3:::${DocumentBucket}
+              - !Sub arn:aws:s3:::${DocumentBucket}/*
+            Principal: '*'
+            Condition:
+              Bool:
+                'aws:SecureTransport':
+                  - false
+  #-----End - S3 document bucket -----#
+
+  #-----Start - SNS topic and staff email subscription -----#
+  ApplicationStatusTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: ClinicOnboardingAlerts
+      TopicName: ClinicOnboardingAlerts
+      KmsMasterKeyId: alias/aws/sns
+
+  StaffEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ApplicationStatusTopic
+      Protocol: email
+      Endpoint: !Ref StaffAlertEmail
+  #-----End - SNS topic and staff email subscription -----#
+
+  #-----Start - DynamoDB patient verification table with auto-scaling -----#
+  PatientVerificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PatientVerificationTable
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: PATIENT_ID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PATIENT_ID
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+
+  DDBWriteAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: PatientVerificationTable
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 2
+      ResourceId: table/PatientVerificationTable
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/dynamodb.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_DynamoDBTable
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  DDBReadAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: PatientVerificationTable
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 2
+      ResourceId: table/PatientVerificationTable
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/dynamodb.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_DynamoDBTable
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  TableWriteScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: WriteAutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref DDBWriteAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        ScaleInCooldown: 2
+        ScaleOutCooldown: 2
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  TableReadScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ReadAutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref DDBReadAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        ScaleInCooldown: 2
+        ScaleOutCooldown: 2
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+  #-----End - DynamoDB patient verification table with auto-scaling -----#
+
+  #-----Start - Lambda functions -----#
+
+  # CompareFaces — Rekognition face match between selfie and driver's license photo
+  CompareFacesLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicCompareFacesFunction
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/CompareFacesLambdaRole
+      CodeUri: CompareFacesLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref PatientVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+
+  # ExtractLicenseDetails — Textract analyze_id to OCR the driver's license
+  ExtractLicenseDetailsLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicExtractLicenseDetailsFunction
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/ExtractLicenseDetailsLambdaRole
+      CodeUri: ExtractLicenseDetailsLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref PatientVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+
+  # ExtractInsurance — Textract analyze_document (Queries) to read insurance card
+  ExtractInsuranceLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicExtractInsuranceFunction
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/ExtractInsuranceLambdaRole
+      CodeUri: ExtractInsuranceLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref PatientVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+          CLINIC_API_URL: !Ref ClinicApiUrl
+
+  # StoreVerification — merges parallel results, finalises DynamoDB record,
+  # and POSTs identity verification to the clinic API
+  StoreVerificationLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicStoreVerificationFunction
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/StoreVerificationLambdaRole
+      CodeUri: StoreVerificationLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref PatientVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+          CLINIC_API_URL: !Ref ClinicApiUrl
+
+  #-----End - Lambda functions -----#
+
+  #-----Start - EventBridge rule -----#
+  # Triggers the state machine when a _selfie.png is uploaded.
+  # Staff uploads license and insurance card first, then takes the selfie
+  # to complete the bundle — the selfie upload acts as the commit signal.
+  PatientOnboardingEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ClinicPatientSelfieUploadRule
+      Description: >
+        Starts PatientOnboardingStateMachine when a _selfie.png object is
+        created in the document bucket.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref DocumentBucket
+          object:
+            key:
+              - suffix: _selfie.png
+      State: ENABLED
+      Targets:
+        - Id: PatientOnboardingStateMachineTarget
+          Arn: !Ref PatientOnboardingStateMachine
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/EventBridgeStateMachineRole
+
+  #-----End - EventBridge rule -----#
+
+  #-----Start - Step Function state machine -----#
+  PatientOnboardingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: PatientOnboardingStateMachine
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/PatientOnboardingStateMachineRole
+      Tracing:
+        Enabled: true
+      Definition:
+        Comment: >
+          Clinic patient onboarding pipeline. Triggered by selfie upload to S3.
+          Runs face match, license OCR, and insurance card extraction in parallel,
+          then writes the consolidated verification result to the clinic API.
+        StartAt: InitSession
+
+        States:
+
+          # Parse patient_id from the S3 object key using Step Functions
+          # intrinsic functions — no Lambda needed for this simple extraction.
+          # Key format: {patient_id}_selfie.png  →  patient_id = everything before _selfie
+          InitSession:
+            Type: Pass
+            Parameters:
+              patient_id.$: >-
+                States.ArrayGetItem(
+                  States.StringSplit($.detail.object.key, '_selfie'),
+                  0
+                )
+            ResultPath: "$.application"
+            Next: PerformChecks
+
+          # Three independent verifications run concurrently
+          PerformChecks:
+            Type: Parallel
+            ResultPath: "$.checks"
+            Next: StoreVerification
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: OnboardingFailed
+                ResultPath: "$.error"
+            Branches:
+
+              # Branch 1 — Rekognition: selfie vs license photo face match
+              - StartAt: CompareFaces
+                States:
+                  CompareFaces:
+                    Type: Task
+                    Resource: !GetAtt CompareFacesLambdaFunction.Arn
+                    # Returns: { face_match: bool, face_similarity: float }
+                    End: true
+
+              # Branch 2 — Textract analyze_id: OCR the driver's license
+              - StartAt: ExtractLicenseDetails
+                States:
+                  ExtractLicenseDetails:
+                    Type: Task
+                    Resource: !GetAtt ExtractLicenseDetailsLambdaFunction.Arn
+                    # Returns: { extracted: {}, license_valid: bool }
+                    End: true
+
+              # Branch 3 — Textract Queries: read insurance membership card
+              - StartAt: ExtractInsurance
+                States:
+                  ExtractInsurance:
+                    Type: Task
+                    Resource: !GetAtt ExtractInsuranceLambdaFunction.Arn
+                    # Returns: { insurance_data: {}, extraction_ok: bool, needs_review: bool }
+                    # Does NOT hard-fail on missing fields — flags for manual review instead
+                    End: true
+
+          # Merge all three parallel outputs, write final DynamoDB record,
+          # and POST identity verification to /api/patients/{id}/verify.
+          # event.checks = [ faceResult, licenseResult, insuranceResult ]
+          StoreVerification:
+            Type: Task
+            Resource: !GetAtt StoreVerificationLambdaFunction.Arn
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: OnboardingFailed
+                ResultPath: "$.error"
+            End: true
+
+          # Terminal failure state — face mismatch or clinic API unreachable.
+          # SNS alert is published inside the Lambda that raised the error;
+          # this state exists so executions show as FAILED in the console
+          # rather than SUCCEEDED with an error buried in output.
+          OnboardingFailed:
+            Type: Fail
+            Error: OnboardingVerificationFailed
+            Cause: >
+              One or more verification checks failed. Check SNS alerts and
+              the PatientVerificationTable for details.
+
+  #-----End - Step Function state machine -----#
+
+Outputs:
+
+  DocumentBucketName:
+    Description: S3 bucket where clinic staff upload patient images
+    Value: !Ref DocumentBucket
+
+  PatientVerificationTableName:
+    Description: DynamoDB table storing verification results per patient
+    Value: !Ref PatientVerificationTable
+
+  ApplicationStatusTopicArn:
+    Description: SNS topic ARN for onboarding failure alerts
+    Value: !Ref ApplicationStatusTopic
+
+  StateMachineArn:
+    Description: ARN of the patient onboarding Step Functions state machine
+    Value: !Ref PatientOnboardingStateMachine
