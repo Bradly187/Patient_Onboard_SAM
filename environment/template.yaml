@@ -20,6 +20,11 @@ Parameters:
     Description: >
       Email address that receives SNS alerts for failed verifications
       and cards requiring manual review.
+  LicenseVerifyUrl:
+    Type: String
+    Description: >
+      URL of the external medical board license verification API.
+      e.g. https://verify.medboard.example.com/verify
 #-----End - Parameters -----#
 
 Globals:
@@ -366,6 +371,393 @@ Resources:
 
   #-----End - Step Function state machine -----#
 
+  #-----Start - Therapist/Doctor Onboarding Resources -----#
+
+  #-----Start - DynamoDB therapist verification table with auto-scaling -----#
+  TherapistVerificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TherapistVerificationTable
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: THERAPIST_ID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: THERAPIST_ID
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+
+  TherapistDDBWriteAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: TherapistVerificationTable
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 2
+      ResourceId: table/TherapistVerificationTable
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/dynamodb.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_DynamoDBTable
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  TherapistDDBReadAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: TherapistVerificationTable
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 2
+      ResourceId: table/TherapistVerificationTable
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/dynamodb.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_DynamoDBTable
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  TherapistTableWriteScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: WriteAutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref TherapistDDBWriteAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        ScaleInCooldown: 2
+        ScaleOutCooldown: 2
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  TherapistTableReadScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ReadAutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref TherapistDDBReadAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        ScaleInCooldown: 2
+        ScaleOutCooldown: 2
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+  #-----End - DynamoDB therapist verification table with auto-scaling -----#
+
+  #-----Start - Therapist Lambda functions -----#
+
+  # CompareFaces — Rekognition face match between selfie and driver's license photo
+  TherapistCompareFacesLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicTherapistCompareFacesFunction
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/CompareFacesLambdaRole
+      CodeUri: CompareFacesLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref TherapistVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+
+  # VerifyMedicalLicense — Verifies the medical license
+  VerifyMedicalLicenseLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicVerifyMedicalLicenseFunction
+      Role: !GetAtt VerifyMedicalLicenseLambdaRole.Arn
+      CodeUri: VerifyMedicalLicenseLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref TherapistVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+          LICENSE_VERIFY_URL: !Ref LicenseVerifyUrl
+
+  # ExtractMedicalLicense — Textract to OCR the medical license
+  ExtractMedicalLicenseLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicExtractMedicalLicenseFunction
+      Role: !GetAtt ExtractMedicalLicenseLambdaRole.Arn
+      CodeUri: ExtractMedicalLicenseLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref TherapistVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+
+  # StoreTherapistVerification — merges parallel results, finalises DynamoDB record
+  StoreTherapistVerificationLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ClinicStoreTherapistVerificationFunction
+      Role: !GetAtt StoreTherapistVerificationLambdaRole.Arn
+      CodeUri: StoreTherapistVerificationLambdaFunction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE: !Ref TherapistVerificationTable
+          TOPIC: !GetAtt ApplicationStatusTopic.TopicArn
+          CLINIC_API_URL: !Ref ClinicApiUrl
+
+  #-----End - Therapist Lambda functions -----#
+
+  #-----Start - Therapist EventBridge rule -----#
+  # Triggers the state machine when a _therapist_selfie.png is uploaded.
+  TherapistOnboardingEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ClinicTherapistSelfieUploadRule
+      Description: >
+        Starts TherapistOnboardingStateMachine when a _therapist_selfie.png object is
+        created in the document bucket.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref DocumentBucket
+          object:
+            key:
+              - suffix: _therapist_selfie.png
+      State: ENABLED
+      Targets:
+        - Id: TherapistOnboardingStateMachineTarget
+          Arn: !Ref TherapistOnboardingStateMachine
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/EventBridgeStateMachineRole
+
+  #-----End - Therapist EventBridge rule -----#
+
+  #-----Start - Therapist Step Function state machine -----#
+  TherapistOnboardingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: TherapistOnboardingStateMachine
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/TherapistOnboardingStateMachineRole
+      Tracing:
+        Enabled: true
+      Definition:
+        Comment: >
+          Clinic therapist/doctor onboarding pipeline. Triggered by selfie upload to S3.
+          Runs face match, medical license verification, and medical license OCR in parallel,
+          then writes the consolidated verification result to the clinic API.
+        StartAt: InitTherapistSession
+
+        States:
+
+          InitTherapistSession:
+            Type: Pass
+            Parameters:
+              therapist_id.$: >-
+                States.ArrayGetItem(
+                  States.StringSplit($.detail.object.key, '_therapist_selfie'),
+                  0
+                )
+            ResultPath: "$.application"
+            Next: PerformTherapistChecks
+
+          PerformTherapistChecks:
+            Type: Parallel
+            ResultPath: "$.checks"
+            Next: StoreTherapistVerification
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: TherapistOnboardingFailed
+                ResultPath: "$.error"
+            Branches:
+
+              - StartAt: TherapistCompareFaces
+                States:
+                  TherapistCompareFaces:
+                    Type: Task
+                    Resource: !GetAtt TherapistCompareFacesLambdaFunction.Arn
+                    End: true
+
+              - StartAt: VerifyMedicalLicense
+                States:
+                  VerifyMedicalLicense:
+                    Type: Task
+                    Resource: !GetAtt VerifyMedicalLicenseLambdaFunction.Arn
+                    End: true
+
+              - StartAt: ExtractMedicalLicense
+                States:
+                  ExtractMedicalLicense:
+                    Type: Task
+                    Resource: !GetAtt ExtractMedicalLicenseLambdaFunction.Arn
+                    End: true
+
+          StoreTherapistVerification:
+            Type: Task
+            Resource: !GetAtt StoreTherapistVerificationLambdaFunction.Arn
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: TherapistOnboardingFailed
+                ResultPath: "$.error"
+            End: true
+
+          TherapistOnboardingFailed:
+            Type: Fail
+            Error: OnboardingVerificationFailed
+            Cause: >
+              One or more verification checks failed. Check SNS alerts and
+              the TherapistVerificationTable for details.
+
+  #-----End - Therapist Step Function state machine -----#
+
+  #-----End - Therapist/Doctor Onboarding Resources -----#
+
+  #-----Start - Therapist IAM Roles -----#
+  TherapistOnboardingStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "TherapistOnboardingStateMachinePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt TherapistCompareFacesLambdaFunction.Arn
+                  - !GetAtt VerifyMedicalLicenseLambdaFunction.Arn
+                  - !GetAtt ExtractMedicalLicenseLambdaFunction.Arn
+                  - !GetAtt StoreTherapistVerificationLambdaFunction.Arn
+
+  VerifyMedicalLicenseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "VerifyMedicalLicenseLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                Resource: !GetAtt TherapistVerificationTable.Arn
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref ApplicationStatusTopic
+
+  ExtractMedicalLicenseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "ExtractMedicalLicenseLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:UpdateItem"
+                Resource: !GetAtt TherapistVerificationTable.Arn
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref ApplicationStatusTopic
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                Resource: !Sub arn:aws:s3:::${DocumentBucket}/*
+              - Effect: "Allow"
+                Action:
+                  - "textract:AnalyzeDocument"
+                Resource: "*"
+
+  StoreTherapistVerificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "StoreTherapistVerificationLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:UpdateItem"
+                Resource: !GetAtt TherapistVerificationTable.Arn
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref ApplicationStatusTopic
+  #-----End - Therapist IAM Roles -----#
+
 Outputs:
 
   DocumentBucketName:
@@ -376,6 +768,10 @@ Outputs:
     Description: DynamoDB table storing verification results per patient
     Value: !Ref PatientVerificationTable
 
+  TherapistVerificationTableName:
+    Description: DynamoDB table storing verification results per therapist
+    Value: !Ref TherapistVerificationTable
+
   ApplicationStatusTopicArn:
     Description: SNS topic ARN for onboarding failure alerts
     Value: !Ref ApplicationStatusTopic
@@ -383,3 +779,7 @@ Outputs:
   StateMachineArn:
     Description: ARN of the patient onboarding Step Functions state machine
     Value: !Ref PatientOnboardingStateMachine
+
+  TherapistStateMachineArn:
+    Description: ARN of the therapist onboarding Step Functions state machine
+    Value: !Ref TherapistOnboardingStateMachine

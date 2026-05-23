@@ -4,5 +4,5 @@ version = 0.1
 stack_name = "kyc-app"
 resolve_s3 = true
 s3_prefix = "kyc-app"
-capabilities = "CAPABILITY_IAM"
+capabilities = "CAPABILITY_NAMED_IAM"
 image_repositories = []

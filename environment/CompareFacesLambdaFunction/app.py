@@ -1,69 +1,74 @@
-"Compare the license and selfie photos"
 import os
+from decimal import Decimal
 import boto3
 
 env_table = os.environ['TABLE']
 env_topic = os.environ['TOPIC']
 
-s3 = boto3.client('s3')
-unzipped_s3_prefix = "unzipped/"
 dynamodb = boto3.resource('dynamodb')
 ddb_table = dynamodb.Table(env_table)
 rekognition = boto3.client('rekognition')
 sns = boto3.client('sns')
 
-def compare_faces(app_uuid, bucket, license_key, selfie_key):
-    "calls rekognition to compare license and selfie"
-    print("Starting face comparison")
-    compare_response = rekognition.compare_faces(
-        SourceImage={'S3Object': {
-            'Bucket': bucket,
-            'Name': license_key,
-        }},
-        TargetImage={'S3Object': {
-            'Bucket': bucket,
-            'Name': selfie_key,
-        }},
-        SimilarityThreshold=80
+SIMILARITY_THRESHOLD = 80
+
+
+def compare_faces(entity_id, id_attr, bucket, license_key, selfie_key):
+    response = rekognition.compare_faces(
+        SourceImage={'S3Object': {'Bucket': bucket, 'Name': license_key}},
+        TargetImage={'S3Object': {'Bucket': bucket, 'Name': selfie_key}},
+        SimilarityThreshold=SIMILARITY_THRESHOLD,
     )
 
-    if len(compare_response['FaceMatches']) < 1:
-        photo_match_result = False
+    if response['FaceMatches']:
+        similarity = response['FaceMatches'][0]['Similarity']
+        face_match = similarity >= SIMILARITY_THRESHOLD
     else:
-        photo_match_result = compare_response['FaceMatches'][0]['Similarity'] >= 80
+        similarity = 0.0
+        face_match = False
 
-    # Update DDB with photo match value
     ddb_table.update_item(
-        Key={
-            'APP_UUID': app_uuid
-            },
-        UpdateExpression='SET LICENSE_SELFIE_MATCH = :p_match',
+        Key={id_attr: entity_id},
+        UpdateExpression='SET FACE_MATCH = :match, FACE_SIMILARITY = :sim',
         ExpressionAttributeValues={
-            ':p_match': photo_match_result
-            }
+            ':match': face_match,
+            ':sim':   Decimal(str(round(similarity, 2))),
+        },
+    )
+
+    if not face_match:
+        sns.publish(
+            TopicArn=env_topic,
+            Message=(
+                f"Face comparison FAILED for {id_attr} {entity_id}. "
+                f"Similarity: {similarity:.1f}%"
+            ),
+            Subject='Onboarding — Face Match Failed',
         )
 
-    # SNS publish, and S3 folder
-    if not photo_match_result:
-        sns.publish(
-            TopicArn= env_topic,
-            Message= 'License photo validation FAILED',
-            Subject='License photo validation FAILED',
-            )
+    return face_match, round(similarity, 2)
 
-    print("finished compare faces")
-    return photo_match_result
 
 def lambda_handler(event, context):
-    "Build the s3 references to the selfie and license and compare with rekognition"
     bucket = event['detail']['bucket']['name']
-    app_uuid = event["application"]["app_uuid"]
-    selfie_key = f"{unzipped_s3_prefix}{app_uuid}_selfie.png"
-    license_key = f"{unzipped_s3_prefix}{app_uuid}_license.png"
+    app = event['application']
 
-    # Submit license and selfie to rekognition to compare faces
-    rekog_response = compare_faces(app_uuid, bucket, license_key, selfie_key)
-    if not rekog_response:
-        raise ValueError('Photo rekognition match FAILED. Program will stop')
+    if 'patient_id' in app:
+        entity_id = app['patient_id']
+        id_attr = 'PATIENT_ID'
+        selfie_key = f"{entity_id}_selfie.png"
+    else:
+        entity_id = app['therapist_id']
+        id_attr = 'THERAPIST_ID'
+        selfie_key = f"{entity_id}_therapist_selfie.png"
 
-    return True
+    license_key = f"{entity_id}_license.jpg"
+
+    face_match, face_similarity = compare_faces(entity_id, id_attr, bucket, license_key, selfie_key)
+
+    id_field = 'patient_id' if id_attr == 'PATIENT_ID' else 'therapist_id'
+    return {
+        id_field:          entity_id,
+        'face_match':      face_match,
+        'face_similarity': face_similarity,
+    }

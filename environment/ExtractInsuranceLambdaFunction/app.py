@@ -2,7 +2,7 @@
 import os
 import boto3
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 env_table = os.environ['TABLE']
 env_topic = os.environ['TOPIC']
@@ -49,15 +49,6 @@ def extract_insurance_card(bucket, insurance_key):
         QueriesConfig={'Queries': INSURANCE_QUERIES},
     )
 
-    extracted = {}
-    for block in response['Blocks']:
-        if block['BlockType'] == 'QUERY_RESULT':
-            alias = block.get('Text', '')
-            # Match result back to its query alias via relationships
-            extracted[alias] = block.get('Text', '').strip()
-
-    # Re-extract using alias mapping since QUERY_RESULT blocks carry the answer text
-    # but we need to correlate via the QUERY blocks that hold the alias
     alias_map = {}
     query_blocks = {b['Id']: b for b in response['Blocks'] if b['BlockType'] == 'QUERY'}
     result_blocks = {b['Id']: b for b in response['Blocks'] if b['BlockType'] == 'QUERY_RESULT'}
@@ -110,7 +101,7 @@ def store_to_dynamodb(patient_id, alias_map, extraction_ok, missing_fields):
             ':ins':     {k: v['value'] for k, v in alias_map.items()},
             ':ok':      extraction_ok,
             ':missing': list(missing_fields),
-            ':ts':      datetime.utcnow().isoformat(),
+            ':ts':      datetime.now(timezone.utc).isoformat(),
         }
     )
 
@@ -139,7 +130,7 @@ def post_to_clinic_api(patient_id, alias_map):
         'rxGroup':               val('RX_GROUP'),
         'memberServicesPhone':   val('MEMBER_SERVICES_PHONE'),
         'providerServicesPhone': val('PROVIDER_SERVICES_PHONE'),
-        'extractedAt':           datetime.utcnow().isoformat(),
+        'extractedAt':           datetime.now(timezone.utc).isoformat(),
     }
 
     r = requests.post(
@@ -155,7 +146,7 @@ def lambda_handler(event, context):
     "Extract insurance card details and store against the patient record"
     bucket = event['detail']['bucket']['name']
     patient_id = event['application']['patient_id']
-    insurance_key = f"{patient_id}_insurance.png"
+    insurance_key = f"{patient_id}_insurance.jpg"
 
     alias_map = extract_insurance_card(bucket, insurance_key)
 
